@@ -6,7 +6,14 @@ import json
 import uuid
 
 from .core import DataPacket
-from .pipeline import ComputePriorityScore, Pipeline, RetryPolicy, RouteByScore, ValidateRequiredFields
+from .pipeline import (
+    ComputePriorityScore,
+    FlakyEnricher,
+    Pipeline,
+    RetryPolicy,
+    RouteByScore,
+    ValidateRequiredFields,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -17,6 +24,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--description", default="Intermittent API failures across regions")
     parser.add_argument("--urgency", type=int, default=4)
     parser.add_argument("--customer-tier", type=int, default=3)
+    parser.add_argument("--with-flaky-enricher", action="store_true")
+    parser.add_argument("--flaky-failures", type=int, default=1)
+    parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     return parser.parse_args()
 
@@ -33,25 +43,35 @@ async def _run() -> None:
         },
     )
 
+    stages = [
+        ValidateRequiredFields({"description", "urgency", "customer_tier"}),
+        ComputePriorityScore(),
+    ]
+    if args.with_flaky_enricher:
+        stages.append(FlakyEnricher(args.flaky_failures))
+    stages.append(RouteByScore())
+
     pipeline = Pipeline(
-        stages=[
-            ValidateRequiredFields({"description", "urgency", "customer_tier"}),
-            ComputePriorityScore(),
-            RouteByScore(),
-        ],
-        retry_policy=RetryPolicy(max_attempts=2, backoff_base_s=0.005),
+        stages=stages,
+        retry_policy=RetryPolicy(max_attempts=args.max_attempts, backoff_base_s=0.005),
     )
 
-    final_packet, stage_results = await pipeline.run(packet)
+    stage_results, report = await pipeline.run_with_report(packet)
 
     if args.json:
         print(
             json.dumps(
                 {
                     "packet": {
-                        "id": final_packet.id,
-                        "payload": final_packet.payload,
-                        "tags": sorted(final_packet.tags),
+                        "id": packet.id,
+                        "payload": packet.payload,
+                        "tags": sorted(packet.tags),
+                    },
+                    "report": {
+                        "ok": report.ok,
+                        "total_duration_ms": round(report.total_duration_ms, 3),
+                        "completed_stages": report.completed_stages,
+                        "failed_stage": report.failed_stage,
                     },
                     "stages": [
                         {
@@ -69,12 +89,19 @@ async def _run() -> None:
         return
 
     print("🚀 impress-engine run complete")
-    print(f"packet_id={final_packet.id}")
-    print(f"tags={sorted(final_packet.tags)}")
+    print(f"packet_id={packet.id}")
+    print(f"tags={sorted(packet.tags)}")
+    print(
+        "report="
+        f"ok:{report.ok} "
+        f"total:{report.total_duration_ms:.2f}ms "
+        f"completed:{report.completed_stages} "
+        f"failed_stage:{report.failed_stage}"
+    )
     for r in stage_results:
         state = "OK" if r.ok else "FAIL"
         print(f" - [{state}] {r.stage_name:<24} {r.duration_ms:7.2f}ms  {r.details}")
-    print(f"final_payload={final_packet.payload}")
+    print(f"final_payload={packet.payload}")
 
 
 def main() -> None:

@@ -18,6 +18,15 @@ class RetryPolicy:
         return self.backoff_base_s * (2 ** (attempt - 1))
 
 
+@dataclass(slots=True)
+class PipelineReport:
+    packet_id: str
+    ok: bool
+    total_duration_ms: float
+    completed_stages: int
+    failed_stage: str | None
+
+
 class Pipeline:
     """Async pipeline with retries and observability hooks."""
 
@@ -30,6 +39,11 @@ class Pipeline:
         self._retry = retry_policy or RetryPolicy()
 
     async def run(self, packet: DataPacket) -> tuple[DataPacket, list[StageResult]]:
+        results, _ = await self.run_with_report(packet)
+        return packet, results
+
+    async def run_with_report(self, packet: DataPacket) -> tuple[list[StageResult], PipelineReport]:
+        t0 = time.perf_counter()
         results: list[StageResult] = []
 
         for stage in self._stages:
@@ -37,10 +51,24 @@ class Pipeline:
             results.append(result)
             if not result.ok:
                 packet.tags.add("pipeline:failed")
-                return packet, results
+                report = PipelineReport(
+                    packet_id=packet.id,
+                    ok=False,
+                    total_duration_ms=(time.perf_counter() - t0) * 1000,
+                    completed_stages=sum(1 for r in results if r.ok),
+                    failed_stage=stage.name,
+                )
+                return results, report
 
         packet.tags.add("pipeline:complete")
-        return packet, results
+        report = PipelineReport(
+            packet_id=packet.id,
+            ok=True,
+            total_duration_ms=(time.perf_counter() - t0) * 1000,
+            completed_stages=len(results),
+            failed_stage=None,
+        )
+        return results, report
 
     async def _run_stage_with_retry(self, stage: Stage, packet: DataPacket) -> StageResult:
         last_error: Exception | None = None
@@ -50,6 +78,8 @@ class Pipeline:
             try:
                 details = await stage(packet)
                 duration_ms = (time.perf_counter() - t0) * 1000
+                if "attempt" not in details:
+                    details["attempt"] = attempt
                 return StageResult(stage.name, True, duration_ms, details)
             except Exception as exc:  # stage-level fault boundary
                 last_error = exc
@@ -107,3 +137,21 @@ class RouteByScore:
         packet.payload["route"] = queue
         packet.tags.add(f"route:{queue}")
         return {"route": queue}
+
+
+class FlakyEnricher:
+    """Demo stage: fails N times, then succeeds with enrichment."""
+
+    name = "flaky_enricher"
+
+    def __init__(self, failures_before_success: int = 1) -> None:
+        self.failures_before_success = failures_before_success
+        self._calls = 0
+
+    async def __call__(self, packet: DataPacket) -> dict[str, Any]:
+        self._calls += 1
+        if self._calls <= self.failures_before_success:
+            raise RuntimeError("Transient enrichment backend error")
+        packet.payload["enriched"] = True
+        packet.tags.add("enriched")
+        return {"enriched": True, "attempt": self._calls}
